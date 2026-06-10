@@ -19,15 +19,13 @@ export function WorkspaceShortcutTargetsSubscriber({
   enabled: boolean;
   serverId: string | null;
 }) {
-  const { projects } = useSidebarWorkspacesList({ serverId, enabled });
+  const { projects } = useSidebarWorkspacesList({ hostFilter: null, enabled });
   const statusWorkspaces = useStatusModeWorkspaceEntries({
-    serverId: enabled ? serverId : null,
+    serverIds: enabled ? null : [],
     projects,
   });
-  const projectNamesByKey = useProjectNamesMap(enabled ? serverId : null);
-  const groupMode = useSidebarViewStore((state) =>
-    enabled && serverId ? state.getGroupMode(serverId) : "project",
-  );
+  const projectNamesByKey = useProjectNamesMap(enabled ? null : []);
+  const groupMode = useSidebarViewStore((state) => state.groupMode);
   const collapsedProjectKeys = useSidebarCollapsedSectionsStore(
     (state) => state.collapsedProjectKeys,
   );

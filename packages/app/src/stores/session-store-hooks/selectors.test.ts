@@ -11,7 +11,7 @@ import {
   selectWorkspaceExecutionAuthority,
   selectWorkspaceFields,
   selectWorkspaceKeys,
-  selectWorkspaceOrderByScopeForServer,
+  selectWorkspaceOrderByScope,
   selectWorkspaceStatusesForBadges,
   selectWorkspaceStructureProjects,
   workspaceEqualityFns,
@@ -83,8 +83,8 @@ function trackSelector<S, T>(
 
 function emptySidebarOrder(): SidebarOrderSnapshot {
   return {
-    projectOrderByServerId: {},
-    workspaceOrderByServerAndProject: {},
+    projectOrder: [],
+    workspaceOrderByProject: {},
   };
 }
 
@@ -206,10 +206,9 @@ describe("workspace structure composition", () => {
     sidebar: SidebarOrderSnapshot,
   ): ReturnType<typeof composeWorkspaceStructure> {
     return composeWorkspaceStructure({
-      serverId,
-      projects: selectWorkspaceStructureProjects(useSessionStore.getState(), serverId),
-      projectOrder: selectProjectOrder(sidebar, serverId),
-      workspaceOrderByScope: selectWorkspaceOrderByScopeForServer(sidebar, serverId),
+      projects: selectWorkspaceStructureProjects(useSessionStore.getState(), [serverId]),
+      projectOrder: selectProjectOrder(sidebar),
+      workspaceOrderByScope: selectWorkspaceOrderByScope(sidebar),
     });
   }
 
@@ -220,7 +219,7 @@ describe("workspace structure composition", () => {
 
     const tracked = trackSelector(
       useSessionStore,
-      (state) => selectWorkspaceStructureProjects(state, SERVER_ID),
+      (state) => selectWorkspaceStructureProjects(state, [SERVER_ID]),
       workspaceEqualityFns.deep,
     );
     const before = tracked.current;
@@ -245,7 +244,7 @@ describe("workspace structure composition", () => {
 
     const tracked = trackSelector(
       useSessionStore,
-      (state) => selectWorkspaceStructureProjects(state, SERVER_ID),
+      (state) => selectWorkspaceStructureProjects(state, [SERVER_ID]),
       workspaceEqualityFns.deep,
     );
     const before = tracked.current;
@@ -274,7 +273,7 @@ describe("workspace structure composition", () => {
     const before = snapshotStructure(SERVER_ID, emptySidebarOrder());
     const after = snapshotStructure(SERVER_ID, {
       ...emptySidebarOrder(),
-      projectOrderByServerId: { [SERVER_ID]: ["project-b", "project-a"] },
+      projectOrder: ["project-b", "project-a"],
     });
 
     expect(after.projects.map((project) => project.projectKey)).toEqual(["project-b", "project-a"]);
