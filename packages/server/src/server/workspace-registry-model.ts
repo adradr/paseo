@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import type {
@@ -5,6 +6,7 @@ import type {
   ProjectPlacementPayload,
 } from "@getpaseo/protocol/messages";
 import { parseGitRevParsePath } from "../utils/git-rev-parse-path.js";
+import { isSameOrDescendantPath } from "./path-utils.js";
 import type { PersistedWorkspaceRecord } from "./workspace-registry.js";
 
 export type PersistedProjectKind = "git" | "non_git";
@@ -33,6 +35,28 @@ export function normalizeWorkspaceId(cwd: string): string {
     return cwd;
   }
   return resolve(trimmed);
+}
+
+export function resolveWorkspaceRecordForCwd(
+  cwd: string,
+  workspaces: Iterable<PersistedWorkspaceRecord>,
+): PersistedWorkspaceRecord | null {
+  const normalizedCwd = normalizeWorkspaceId(cwd);
+  const userHome = normalizeWorkspaceId(homedir());
+  let bestMatch: { workspace: PersistedWorkspaceRecord; cwd: string } | null = null;
+
+  for (const workspace of workspaces) {
+    if (workspace.archivedAt) continue;
+
+    const workspaceCwd = normalizeWorkspaceId(workspace.cwd);
+    if (workspaceCwd === userHome && normalizedCwd !== workspaceCwd) continue;
+    if (!isSameOrDescendantPath(workspaceCwd, normalizedCwd)) continue;
+    if (!bestMatch || workspaceCwd.length > bestMatch.cwd.length) {
+      bestMatch = { workspace, cwd: workspaceCwd };
+    }
+  }
+
+  return bestMatch?.workspace ?? null;
 }
 
 export function deriveWorkspaceId(cwd: string, checkout: ProjectCheckoutLitePayload): string {
