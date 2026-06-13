@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { sep } from "node:path";
 import type pino from "pino";
 import type {
   AgentSnapshotPayload,
@@ -13,7 +15,10 @@ import {
 import { getParentAgentIdFromLabels, isDelegatedAgent } from "@getpaseo/protocol/agent-labels";
 import { SortablePager } from "./pagination/sortable-pager.js";
 import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "./workspace-registry.js";
-import { normalizeWorkspaceId, resolveWorkspaceRecordForCwd } from "./workspace-registry-model.js";
+import {
+  normalizeWorkspaceId,
+  resolveActiveWorkspaceRecordForCwd,
+} from "./workspace-registry-model.js";
 import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 
 type WorkspaceIdResolver = (cwd: string) => string | undefined;
@@ -181,8 +186,13 @@ export class WorkspaceDirectory {
     );
     const descriptorsByWorkspaceId = new Map<string, WorkspaceDescriptorPayload>();
     const workspaceIds = options.workspaceIds ? new Set(options.workspaceIds) : null;
-    const resolveWorkspaceIdForCwd: WorkspaceIdResolver = (cwd) =>
-      resolveWorkspaceRecordForCwd(cwd, activeRecords)?.workspaceId;
+    const workspaceIdsByDirectory = new Map(
+      activeRecords.map(
+        (workspace) => [normalizeWorkspaceId(workspace.cwd), workspace.workspaceId] as const,
+      ),
+    );
+    const resolveActiveWorkspaceIdForCwd: WorkspaceIdResolver = (cwd) =>
+      resolveActiveWorkspaceRecordForCwd(cwd, activeRecords)?.workspaceId;
 
     const includedWorkspaces = activeRecords.filter(
       (workspace) => !workspaceIds || workspaceIds.has(workspace.workspaceId),
@@ -231,7 +241,7 @@ export class WorkspaceDirectory {
         });
       }
 
-      const workspaceId = resolveWorkspaceIdForCwd(workspaceAgent.cwd);
+      const workspaceId = workspaceIdsByDirectory.get(normalizeWorkspaceId(workspaceAgent.cwd));
       if (workspaceId === undefined) {
         continue;
       }
@@ -250,7 +260,7 @@ export class WorkspaceDirectory {
     // Terminal activity contributions: working terminal → running bucket.
     const terminalEntriesByWorkspaceId = this.applyTerminalContributions(
       terminalContributions,
-      resolveWorkspaceIdForCwd,
+      resolveActiveWorkspaceIdForCwd,
       descriptorsByWorkspaceId,
     );
 
@@ -262,7 +272,7 @@ export class WorkspaceDirectory {
         (agent) =>
           !agent.archivedAt &&
           this.deps.isProviderVisibleToClient(agent.provider) &&
-          resolveWorkspaceIdForCwd(agent.cwd) === workspaceId,
+          workspaceIdsByDirectory.get(normalizeWorkspaceId(agent.cwd)) === workspaceId,
       );
       const terminalEntries = terminalEntriesByWorkspaceId.get(workspaceId) ?? [];
       const result = this.resolveStatusEnteredAt({
@@ -431,7 +441,29 @@ export class WorkspaceDirectory {
 
   resolveRegisteredWorkspaceIdForCwd(cwd: string, workspaces: PersistedWorkspaceRecord[]): string {
     const normalizedCwd = normalizeWorkspaceId(cwd);
-    return resolveWorkspaceRecordForCwd(normalizedCwd, workspaces)?.workspaceId ?? normalizedCwd;
+    const exact = workspaces.find(
+      (workspace) => normalizeWorkspaceId(workspace.cwd) === normalizedCwd,
+    );
+    if (exact) {
+      return exact.workspaceId;
+    }
+
+    const userHome = normalizeWorkspaceId(homedir());
+    let bestMatch: PersistedWorkspaceRecord | null = null;
+    for (const workspace of workspaces) {
+      if (workspace.archivedAt) continue;
+      const workspaceCwd = normalizeWorkspaceId(workspace.cwd);
+      if (workspaceCwd === userHome) continue;
+      const prefix = workspaceCwd.endsWith(sep) ? workspaceCwd : `${workspaceCwd}${sep}`;
+      if (!normalizedCwd.startsWith(prefix)) {
+        continue;
+      }
+      if (!bestMatch || workspaceCwd.length > normalizeWorkspaceId(bestMatch.cwd).length) {
+        bestMatch = workspace;
+      }
+    }
+
+    return bestMatch?.workspaceId ?? normalizedCwd;
   }
 
   async listDescriptors(): Promise<WorkspaceDescriptorPayload[]> {

@@ -37,7 +37,7 @@ export function normalizeWorkspaceId(cwd: string): string {
   return resolve(trimmed);
 }
 
-export function resolveWorkspaceRecordForCwd(
+export function resolveActiveWorkspaceRecordForCwd(
   cwd: string,
   workspaces: Iterable<PersistedWorkspaceRecord>,
 ): PersistedWorkspaceRecord | null {
