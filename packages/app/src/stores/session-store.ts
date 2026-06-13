@@ -276,6 +276,7 @@ export interface SessionState {
 
   // Focus
   focusedAgentId: string | null;
+  focusedTerminalId: string | null;
 
   // Messages
   messages: MessageEntry[];
@@ -334,6 +335,7 @@ interface SessionStoreActions {
 
   // Focus
   setFocusedAgentId: (serverId: string, agentId: string | null) => void;
+  setFocusedTerminalId: (serverId: string, terminalId: string | null) => void;
 
   // Messages
   setMessages: (
@@ -474,6 +476,7 @@ function createInitialSessionState(serverId: string, client: DaemonClient): Sess
     hasHydratedWorkspaces: false,
     isPlayingAudio: false,
     focusedAgentId: null,
+    focusedTerminalId: null,
     messages: [],
     currentAssistantMessage: "",
     agentStreamTail: new Map(),
@@ -712,6 +715,25 @@ export const useSessionStore = create<SessionStore>()(
               [serverId]: {
                 ...session,
                 focusedAgentId: agentId,
+              },
+            },
+          };
+        });
+      },
+
+      setFocusedTerminalId: (serverId, terminalId) => {
+        set((prev) => {
+          const session = prev.sessions[serverId];
+          if (!session || session.focusedTerminalId === terminalId) {
+            return prev;
+          }
+          return {
+            ...prev,
+            sessions: {
+              ...prev.sessions,
+              [serverId]: {
+                ...session,
+                focusedTerminalId: terminalId,
               },
             },
           };

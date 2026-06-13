@@ -16,6 +16,7 @@ import { getParentAgentIdFromLabels, isDelegatedAgent } from "@getpaseo/protocol
 import { SortablePager } from "./pagination/sortable-pager.js";
 import type { PersistedProjectRecord, PersistedWorkspaceRecord } from "./workspace-registry.js";
 import { normalizeWorkspaceId } from "./workspace-registry-model.js";
+import type { TerminalActivity } from "@getpaseo/protocol/terminal-activity";
 
 const FETCH_WORKSPACES_SORT_KEYS = [
   "status_priority",
@@ -61,6 +62,9 @@ export interface WorkspaceDirectoryDeps {
     list(): Promise<PersistedWorkspaceRecord[]>;
   };
   listAgentPayloads(): Promise<AgentSnapshotPayload[]>;
+  listTerminalActivityContributions(): Promise<
+    Array<{ cwd: string; activity: TerminalActivity | null }>
+  >;
   isProviderVisibleToClient(provider: string): boolean;
   buildWorkspaceDescriptor(input: {
     workspace: PersistedWorkspaceRecord;
@@ -156,11 +160,13 @@ export class WorkspaceDirectory {
     includeGitData: boolean;
     workspaceIds?: Iterable<string>;
   }): Promise<Map<string, WorkspaceDescriptorPayload>> {
-    const [agents, persistedWorkspaces, persistedProjects] = await Promise.all([
-      this.deps.listAgentPayloads(),
-      this.deps.workspaceRegistry.list(),
-      this.deps.projectRegistry.list(),
-    ]);
+    const [agents, persistedWorkspaces, persistedProjects, terminalContributions] =
+      await Promise.all([
+        this.deps.listAgentPayloads(),
+        this.deps.workspaceRegistry.list(),
+        this.deps.projectRegistry.list(),
+        this.deps.listTerminalActivityContributions(),
+      ]);
 
     const activeProjects = new Map(
       persistedProjects
@@ -244,6 +250,13 @@ export class WorkspaceDirectory {
       }
     }
 
+    // Terminal activity contributions: working terminal → running bucket.
+    const terminalEntriesByWorkspaceId = this.applyTerminalContributions(
+      terminalContributions,
+      workspaceIdsByDirectory,
+      descriptorsByWorkspaceId,
+    );
+
     // Resolve the workspace-level `statusEnteredAt` (see aggregate semantics
     // on `resolveStatusEnteredAt`).
     const nowIso = new Date().toISOString();
@@ -254,10 +267,12 @@ export class WorkspaceDirectory {
           this.deps.isProviderVisibleToClient(agent.provider) &&
           workspaceIdsByDirectory.get(normalizeWorkspaceId(agent.cwd)) === workspaceId,
       );
+      const terminalEntries = terminalEntriesByWorkspaceId.get(workspaceId) ?? [];
       const result = this.resolveStatusEnteredAt({
         workspaceId,
         winningBucket: descriptor.status,
         contributingAgents,
+        terminalEntries,
         previous: this.bucketHistoryByWorkspaceId.get(workspaceId) ?? null,
         nowIso,
       });
@@ -272,14 +287,57 @@ export class WorkspaceDirectory {
     return descriptorsByWorkspaceId;
   }
 
+  // Apply working terminal contributions to descriptor statuses and build a map
+  // of terminal timestamp entries per workspace for use in `resolveStatusEnteredAt`.
+  private applyTerminalContributions(
+    terminalContributions: Array<{ cwd: string; activity: TerminalActivity | null }>,
+    workspaceIdsByDirectory: ReadonlyMap<string, string>,
+    descriptorsByWorkspaceId: Map<string, WorkspaceDescriptorPayload>,
+  ): Map<string, Array<{ bucket: WorkspaceStateBucket; changedAtIso: string }>> {
+    const terminalEntriesByWorkspaceId = new Map<
+      string,
+      Array<{ bucket: WorkspaceStateBucket; changedAtIso: string }>
+    >();
+    for (const { cwd, activity } of terminalContributions) {
+      if (!activity) {
+        continue;
+      }
+      let bucket: WorkspaceStateBucket;
+      if (activity.state === "working") {
+        bucket = "running";
+      } else if (activity.state === "attention") {
+        bucket = "needs_input";
+      } else {
+        continue;
+      }
+      const workspaceId = workspaceIdsByDirectory.get(normalizeWorkspaceId(cwd));
+      if (workspaceId === undefined) {
+        continue;
+      }
+      const existing = descriptorsByWorkspaceId.get(workspaceId);
+      if (!existing) {
+        continue;
+      }
+      if (
+        getWorkspaceStateBucketPriority(bucket) < getWorkspaceStateBucketPriority(existing.status)
+      ) {
+        existing.status = bucket;
+      }
+      const entries = terminalEntriesByWorkspaceId.get(workspaceId) ?? [];
+      entries.push({ bucket, changedAtIso: new Date(activity.changedAt).toISOString() });
+      terminalEntriesByWorkspaceId.set(workspaceId, entries);
+    }
+    return terminalEntriesByWorkspaceId;
+  }
+
   // Aggregate the workspace-level `statusEnteredAt` from its contributing
-  // agents. Aggregate semantics:
-  //   - winning bucket = highest-priority across contributing agents;
-  //   - entry time = best-effort timestamp from agents in the winning bucket;
+  // agents and terminals. Aggregate semantics:
+  //   - winning bucket = highest-priority across contributing agents and terminals;
+  //   - entry time = best-effort timestamp from agents/terminals in the winning bucket;
   //   - priority unmasking: when the winning bucket transitions (e.g. a
   //     higher-priority bucket cleared), the new entry time is "now";
   //   - same-bucket emits reuse the previous entered-at;
-  //   - empty workspaces that never had contributing agents get
+  //   - empty workspaces that never had contributing agents or terminals get
   //     `statusEnteredAt: null`.
   //   - when archived agents leave a previously active workspace empty, keep
   //     the previous done timestamp or stamp the transition to done now.
@@ -287,6 +345,7 @@ export class WorkspaceDirectory {
     workspaceId: string;
     winningBucket: WorkspaceStateBucket;
     contributingAgents: AgentSnapshotPayload[];
+    terminalEntries: Array<{ bucket: WorkspaceStateBucket; changedAtIso: string }>;
     previous: WorkspaceBucketHistoryEntry | null;
     nowIso: string;
   }): {
@@ -294,9 +353,9 @@ export class WorkspaceDirectory {
     recordUpdate?: WorkspaceBucketHistoryEntry;
     recordDelete?: true;
   } {
-    const { winningBucket, contributingAgents, previous, nowIso } = params;
+    const { winningBucket, contributingAgents, terminalEntries, previous, nowIso } = params;
 
-    if (contributingAgents.length === 0) {
+    if (contributingAgents.length === 0 && terminalEntries.length === 0) {
       if (!previous) {
         return { statusEnteredAt: null };
       }
@@ -309,8 +368,9 @@ export class WorkspaceDirectory {
     }
 
     if (!previous) {
-      const newestInWinningBucket = this.findNewestAgentTimestampInBucket(
+      const newestInWinningBucket = this.findNewestTimestampInBucket(
         contributingAgents,
+        terminalEntries,
         winningBucket,
       );
       const enteredAt = newestInWinningBucket ?? nowIso;
@@ -333,16 +393,17 @@ export class WorkspaceDirectory {
     };
   }
 
-  // Best-effort newest timestamp across contributing agents whose derived
-  // bucket matches `winningBucket`. Uses available agent fields:
+  // Best-effort newest timestamp across contributing agents and terminal entries
+  // whose bucket matches `winningBucket`. For agents, uses:
   //   - `attentionTimestamp` when attention is set (covers attention/failed)
   //   - `updatedAt` as a general fallback for any bucket
-  // Returns `null` if no matching agent has a parseable timestamp.
-  private findNewestAgentTimestampInBucket(
+  // Returns `null` if no matching contributor has a parseable timestamp.
+  private findNewestTimestampInBucket(
     contributingAgents: AgentSnapshotPayload[],
+    terminalEntries: Array<{ bucket: WorkspaceStateBucket; changedAtIso: string }>,
     winningBucket: WorkspaceStateBucket,
   ): string | null {
-    const candidates = contributingAgents
+    const agentTimestamps = contributingAgents
       .filter((agent) => {
         const derived = deriveAgentStateBucket({
           status: agent.status,
@@ -361,8 +422,13 @@ export class WorkspaceDirectory {
         // Fall back to updatedAt as a general proxy for recent activity.
         return agent.updatedAt;
       })
-      .filter((value): value is string => typeof value === "string" && value.length > 0)
-      .sort();
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
+
+    const terminalTimestamps = terminalEntries
+      .filter((entry) => entry.bucket === winningBucket)
+      .map((entry) => entry.changedAtIso);
+
+    const candidates = [...agentTimestamps, ...terminalTimestamps].sort();
     return candidates.at(-1) ?? null;
   }
 

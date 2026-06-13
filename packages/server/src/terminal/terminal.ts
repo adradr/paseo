@@ -3,16 +3,19 @@ import xterm, { type Terminal as TerminalType } from "@xterm/headless";
 import { randomUUID } from "crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve as resolvePath } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createExternalProcessEnv } from "../server/paseo-env.js";
 import { writePrivateFileAtomicSync } from "../server/private-files.js";
 import type { TerminalCell, TerminalState } from "@getpaseo/protocol/messages";
 import { TerminalInputModeTracker } from "@getpaseo/protocol/terminal-input-mode";
+import { TerminalActivityTracker } from "./activity/terminal-activity-tracker.js";
+import type { TerminalActivity, TerminalActivityState } from "@getpaseo/protocol/terminal-activity";
 
 const { Terminal } = xterm;
 const require = createRequire(import.meta.url);
+const PASEO_CLI_BIN_ENTRY = "@getpaseo/cli/bin/paseo";
 let nodePtySpawnHelperChecked = false;
 const TERMINAL_TITLE_DEBOUNCE_MS = 150;
 const TERMINAL_EXIT_OUTPUT_LINE_LIMIT = 12;
@@ -64,6 +67,11 @@ export type ServerMessage =
   | { type: "snapshotReady"; revision?: number; replayPreamble?: string }
   | { type: "titleChange"; title?: string };
 
+export interface TerminalActivityTransition {
+  activity: TerminalActivity | null;
+  previous: TerminalActivity | null;
+}
+
 export interface TerminalSession {
   id: string;
   name: string;
@@ -73,11 +81,15 @@ export interface TerminalSession {
   onExit(listener: (info: TerminalExitInfo) => void): () => void;
   onCommandFinished(listener: (info: TerminalCommandFinishedInfo) => void): () => void;
   onTitleChange(listener: (title?: string) => void): () => void;
+  onActivityChange(listener: (transition: TerminalActivityTransition) => void): () => void;
   getSize(): { rows: number; cols: number };
   getState(): TerminalState;
   getStateSnapshot(options?: TerminalStateSnapshotOptions): TerminalStateSnapshot;
   getReplayPreamble(): string;
   getTitle(): string | undefined;
+  getActivity(): TerminalActivity | null;
+  setActivity(state: TerminalActivityState): void;
+  clearActivityAttention(): boolean;
   setTitle(title: string): void;
   getExitInfo(): TerminalExitInfo | null;
   kill(): void;
@@ -106,6 +118,7 @@ export interface CreateTerminalOptions {
   cwd: string;
   shell?: string;
   env?: Record<string, string>;
+  activityEnv?: Record<string, string>;
   rows?: number;
   cols?: number;
   name?: string;
@@ -114,10 +127,26 @@ export interface CreateTerminalOptions {
   args?: string[];
 }
 
+function toTerminalActivity(snapshot: {
+  state: TerminalActivityState | null;
+  changedAt: number;
+}): TerminalActivity | null {
+  if (!snapshot.state) {
+    return null;
+  }
+  return { state: snapshot.state, changedAt: snapshot.changedAt };
+}
+
+function resolveInitialTitleMode(presetTitle: string | undefined): "auto" | "manual" {
+  return presetTitle?.trim() ? "manual" : "auto";
+}
+
 interface BuildTerminalEnvironmentInput {
   shell: string;
   env: Record<string, string>;
   zshShellIntegrationDir?: string;
+  paseoCliBinDir?: string | null;
+  paseoHookCliPath?: string | null;
 }
 
 interface EnsureNodePtySpawnHelperExecutableOptions {
@@ -209,7 +238,77 @@ export function resolveZshShellIntegrationDir(): string {
 }
 
 function resolveExternalProcessPath(filePath: string): string {
-  return filePath.replace(/\.asar(?=\/|$)/, ".asar.unpacked");
+  return filePath.replace(/\.asar(?=[/\\]|$)/, ".asar.unpacked");
+}
+
+export function resolvePaseoCliBinDir(): string | null {
+  const cliEntrypoint = resolvePaseoCliBinEntrypoint();
+  if (!cliEntrypoint) {
+    return null;
+  }
+
+  const externalCliEntrypoint = resolveExternalProcessPath(cliEntrypoint);
+  return findNpmBinDir(dirname(externalCliEntrypoint)) ?? dirname(externalCliEntrypoint);
+}
+
+export function resolvePaseoCliExecutablePath(): string | null {
+  const cliEntrypoint = resolvePaseoCliBinEntrypoint();
+  if (!cliEntrypoint) {
+    return null;
+  }
+
+  const externalCliEntrypoint = resolveExternalProcessPath(cliEntrypoint);
+  const npmBinDir = findNpmBinDir(dirname(externalCliEntrypoint));
+  if (npmBinDir) {
+    const shim = resolvePaseoCliShim(npmBinDir);
+    if (shim) {
+      return shim;
+    }
+  }
+
+  return externalCliEntrypoint;
+}
+
+function resolvePaseoCliBinEntrypoint(): string | null {
+  try {
+    return require.resolve(PASEO_CLI_BIN_ENTRY);
+  } catch {
+    return null;
+  }
+}
+
+function findNpmBinDir(startPath: string): string | null {
+  let current = startPath;
+  while (true) {
+    const candidate = join(current, "node_modules", ".bin");
+    if (hasPaseoCliShim(candidate)) {
+      return candidate;
+    }
+
+    const parent = dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function hasPaseoCliShim(binDir: string): boolean {
+  return resolvePaseoCliShim(binDir) !== null;
+}
+
+function resolvePaseoCliShim(binDir: string): string | null {
+  for (const name of paseoCliShimNames()) {
+    const candidate = join(binDir, name);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function paseoCliShimNames(): string[] {
+  return process.platform === "win32" ? ["paseo.cmd", "paseo.exe", "paseo"] : ["paseo"];
 }
 
 function resolveZshShellIntegrationRuntimeDir(): string {
@@ -245,17 +344,64 @@ export function buildTerminalEnvironment(
     TERM: "xterm-256color",
     TERM_PROGRAM: "kitty",
   });
+  const envWithAgentHooks = prependPaseoCliToPath(
+    baseEnv,
+    input.paseoCliBinDir === undefined ? resolvePaseoCliBinDir() : input.paseoCliBinDir,
+  );
+  const envWithHookCli = injectPaseoHookCli(
+    envWithAgentHooks,
+    input.paseoHookCliPath === undefined ? resolvePaseoCliExecutablePath() : input.paseoHookCliPath,
+  );
 
   if (basename(input.shell) !== "zsh") {
-    return baseEnv;
+    return envWithHookCli;
   }
 
-  const originalZdotdir = baseEnv.ZDOTDIR ?? "";
+  const originalZdotdir = envWithHookCli.ZDOTDIR ?? "";
   return {
-    ...baseEnv,
+    ...envWithHookCli,
     PASEO_ZSH_ZDOTDIR: originalZdotdir,
     ZDOTDIR: prepareZshShellIntegrationRuntimeDir(input.zshShellIntegrationDir),
   };
+}
+
+function injectPaseoHookCli(
+  env: Record<string, string>,
+  cliPath: string | null,
+): Record<string, string> {
+  if (!cliPath) {
+    return env;
+  }
+
+  return {
+    ...env,
+    PASEO_HOOK_CLI: resolvePath(resolveExternalProcessPath(cliPath)),
+  };
+}
+
+function prependPaseoCliToPath(
+  env: Record<string, string>,
+  cliBinDir: string | null,
+): Record<string, string> {
+  if (!cliBinDir) {
+    return env;
+  }
+
+  const pathKey = getPathEnvKey(env);
+  const currentPath = env[pathKey] ?? "";
+  return {
+    ...env,
+    [pathKey]: prependPathEntry(currentPath, cliBinDir),
+  };
+}
+
+function getPathEnvKey(env: Record<string, string>): string {
+  return Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+}
+
+function prependPathEntry(currentPath: string, entry: string): string {
+  const entries = currentPath.split(delimiter).filter((value) => value && value !== entry);
+  return [entry, ...entries].join(delimiter);
 }
 
 function extractCell(terminal: TerminalType, row: number, col: number): TerminalCell {
@@ -589,6 +735,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     cwd,
     shell,
     env = {},
+    activityEnv = {},
     rows = 24,
     cols = 80,
     name = "Terminal",
@@ -616,13 +763,15 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
   const recentOutputChunks: string[] = [];
   let recentOutputLength = 0;
   let title: string | undefined;
-  let titleMode: "auto" | "manual" = presetTitle?.trim() ? "manual" : "auto";
+  let titleMode = resolveInitialTitleMode(presetTitle);
   let pendingTitle: string | undefined;
   let titleDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingInput = "";
   let inputFlushImmediate: ReturnType<typeof setImmediate> | null = null;
   let stateRevision = 0;
   const inputModeTracker = new TerminalInputModeTracker();
+  const activityTracker = new TerminalActivityTracker();
+  const activityChangeListeners = new Set<(transition: TerminalActivityTransition) => void>();
   let titleChangeSubscription: { dispose(): void } | null = null;
 
   // Create xterm.js headless terminal
@@ -643,7 +792,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     cols,
     rows,
     cwd,
-    env: buildTerminalEnvironment({ shell: spawnCommand, env }),
+    env: buildTerminalEnvironment({ shell: spawnCommand, env: { ...env, ...activityEnv } }),
   });
 
   function emitTitleChange(nextTitle: string | undefined): void {
@@ -774,6 +923,23 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     return true;
   });
 
+  activityTracker.onChange((snapshot, previousSnapshot) => {
+    if (disposed || killed) {
+      return;
+    }
+    const transition: TerminalActivityTransition = {
+      activity: toTerminalActivity(snapshot),
+      previous: toTerminalActivity(previousSnapshot),
+    };
+    for (const listener of Array.from(activityChangeListeners)) {
+      try {
+        listener(transition);
+      } catch {
+        // no-op
+      }
+    }
+  });
+
   function buildExitInfo(input?: {
     exitCode?: number | null;
     signal?: number | null;
@@ -813,6 +979,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
       return;
     }
     disposed = true;
+    activityTracker.clear();
     pendingInput = "";
     recentOutputChunks.length = 0;
     recentOutputLength = 0;
@@ -824,11 +991,13 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     clearPendingTitleChange();
     disposeTitleChangeSubscription();
     disposeCommandLifecycleSubscription.dispose();
+    activityTracker.dispose();
     terminal.dispose();
     listeners.clear();
     exitListeners.clear();
     commandFinishedListeners.clear();
     titleChangeListeners.clear();
+    activityChangeListeners.clear();
   }
 
   function writeOutputToHeadless(data: string): void {
@@ -1087,8 +1256,29 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     };
   }
 
+  function onActivityChange(
+    listener: (transition: TerminalActivityTransition) => void,
+  ): () => void {
+    activityChangeListeners.add(listener);
+    return () => {
+      activityChangeListeners.delete(listener);
+    };
+  }
+
   function getTitle(): string | undefined {
     return title;
+  }
+
+  function getActivity(): TerminalActivity | null {
+    return toTerminalActivity(activityTracker.getSnapshot());
+  }
+
+  function setActivity(state: TerminalActivityState): void {
+    activityTracker.set(state);
+  }
+
+  function clearActivityAttention(): boolean {
+    return activityTracker.clearAttention();
   }
 
   function getExitInfo(): TerminalExitInfo | null {
@@ -1188,11 +1378,15 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     onExit,
     onCommandFinished,
     onTitleChange,
+    onActivityChange,
     getSize,
     getState,
     getStateSnapshot,
     getReplayPreamble,
     getTitle,
+    getActivity,
+    setActivity,
+    clearActivityAttention,
     setTitle,
     getExitInfo,
     kill,
